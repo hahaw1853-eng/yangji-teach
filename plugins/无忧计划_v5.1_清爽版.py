@@ -2,7 +2,7 @@
 #[disable:false]
 #[public:true]
 #[rule: ^(无忧计划|无忧计划执行|无忧计划任务检测|无忧运行)$]
-#[version: 5.3]
+#[version: 5.4]
 #[price: 0.00]
 #[cron: 0 8 * * *]
 #[title: 无忧计划]
@@ -958,8 +958,9 @@ def query_account(account: str) -> dict:
         if not ads_info.get("enabled", False):
             ad_status = "未启用"
         else:
+            items = ads_info.get("items", [])
             max_views = ads_info.get("max_views_per_day", 0)
-            if max_views <= 0:
+            if len(items) == 0 or max_views <= 0:
                 ad_status = "已达上限"
             else:
                 ad_status = f"剩余 {max_views} 次"
