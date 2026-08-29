@@ -2,7 +2,7 @@
 #[disable:false]
 #[public:true]
 #[rule: ^(无忧计划|无忧计划执行|无忧计划任务检测|无忧运行)$]
-#[version: 5.2]
+#[version: 5.3]
 #[price: 0.00]
 #[cron: 0 8 * * *]
 #[title: 无忧计划]
@@ -925,27 +925,9 @@ def query_account(account: str) -> dict:
 
     app = WuYouPlan(acc, pwd, ua=ua, proxy_api="")
     try:
-        app.attest.ensure()
-        payload = {
-            "account": acc,
-            "password": pwd,
-            "device_id": app.device_id,
-            "platform": "android",
-            "app_version": APP_VERSION,
-        }
-        resp = app.session.post(
-            LOGIN_URL,
-            data=compact_json(payload),
-            headers={"Content-Type": "application/json"},
-            verify=False,
-            timeout=15,
-        )
-        data = resp.json()
-        token = data.get("token")
-        if not token:
-            return {"account": account, "success": False, "error": f"登录失败: {str(data)[:200]}", "nickname": "", "total": 0, "checkin": "未知", "ad_status": "未知", "task_done": 0, "task_total": 0, "all_done": False}
-        app.token = token
-        app.session.headers.update({"authorization": f"Bearer {token}"})
+        # 用 app.login() 走完整签名流程（直连，无代理）
+        if not app.login():
+            return {"account": account, "success": False, "error": "登录失败", "nickname": "", "total": 0, "checkin": "未知", "ad_status": "未知", "task_done": 0, "task_total": 0, "all_done": False}
 
         user = app.get_user_info()
         nickname = user.get("nickname", "")
@@ -957,19 +939,14 @@ def query_account(account: str) -> dict:
         task_done = sum(1 for t in task_list if t.get("is_claimed"))
         task_total = len(task_list)
 
-        # 检查签到
+        # 检查签到（用 _post 带签名）
         checkin_status = "未知"
         try:
-            resp2 = app.session.post(
-                f"{DAILY_TASKS_URL}/daily_checkin/claim",
-                headers={"Content-Type": "application/json", "authorization": f"Bearer {token}"},
-                verify=False,
-                timeout=15,
-            )
-            r2 = resp2.json()
-            if r2.get("ok"):
+            r2 = app._post(f"{DAILY_TASKS_URL}/daily_checkin/claim")
+            data2 = r2.json()
+            if data2.get("ok"):
                 checkin_status = "未领取"
-            elif "已领取" in str(r2) or "已领" in str(r2):
+            elif "已领取" in str(data2) or "已领" in str(data2):
                 checkin_status = "已领取"
             else:
                 checkin_status = "已领取"
@@ -1236,10 +1213,10 @@ def Administration():
         "2️⃣  执行任务\n"
         "3️⃣  删除账号\n"
         "4️⃣  查看账号\n"
-        "6️⃣  查询今日状态 🔍"
+        "5️⃣  查询今日状态 🔍"
     )
     if sender.isAdmin():
-        base_message += "\n5️⃣  全体执行 👑"
+        base_message += "\n6️⃣  全体执行 👑"
     base_message += "\n────────────────────\n⚠️ 输入 q 退出"
     sender.reply(base_message)
     choice = sender.input(60000, 1, False)
@@ -1330,13 +1307,13 @@ def Administration():
         msg += f"────────────────────\n共 {len(accounts)} 个账号"
         sender.reply(msg)
         return
-    elif choice == 6:
+    elif choice == 5:
         if not accounts:
             sender.reply("未绑定任何账号")
             return
         query_all(accounts)
         return
-    elif choice == 5 and sender.isAdmin():
+    elif choice == 6 and sender.isAdmin():
         if not accounts:
             sender.reply("管理员未绑定任何账号")
             return
