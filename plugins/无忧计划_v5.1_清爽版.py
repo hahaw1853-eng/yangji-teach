@@ -2,7 +2,7 @@
 #[disable:false]
 #[public:true]
 #[rule: ^(无忧计划|无忧计划执行|无忧计划任务检测|无忧运行)$]
-#[version: 5.1]
+#[version: 5.2]
 #[price: 0.00]
 #[cron: 0 8 * * *]
 #[title: 无忧计划]
@@ -823,20 +823,24 @@ def format_result(result: dict) -> str:
     return "\n".join(lines)
 
 
-def format_summary(results: list) -> str:
+def format_summary(results: list, done_count: int = 0) -> str:
     total = len(results)
-    success = sum(1 for r in results if r["success"])
-    fail = total - success
-    earned = sum(r.get("earned", 0) for r in results if r["success"])
+    success = sum(1 for r in results if r.get("success") and not r.get("all_done"))
+    fail = sum(1 for r in results if not r.get("success"))
+    earned = sum(r.get("earned", 0) for r in results if r.get("success") and not r.get("all_done"))
     lines = [
         "📊 执行汇总",
         "────────────────────",
-        f"📱 账号 {total} 个",
-        f"✅ 成功 {success}",
+        f"📱 账号 {total + done_count} 个",
+    ]
+    if done_count > 0:
+        lines.append(f"✅ 已完成 {done_count}")
+    lines.extend([
+        f"✅ 本次成功 {success}",
         f"❌ 失败 {fail}",
         f"💰 总收益 +{earned}",
-    ]
-    fails = [r for r in results if not r["success"]]
+    ])
+    fails = [r for r in results if not r.get("success")]
     if fails:
         lines.append("")
         lines.append("⚠️ 失败详情")
@@ -908,7 +912,151 @@ def bind():
         )
 
 
-def execute_account(account: str, proxy_api: str) -> dict:
+def query_account(account: str) -> dict:
+    """直连查询账号今日状态，不走代理"""
+    login_info = middleware.bucketGet(bucket='dd_WuYou_login', key=account)
+    if not login_info:
+        return {"account": account, "success": False, "error": "缺少登录信息", "nickname": "", "total": 0, "checkin": "未知", "ad_status": "未知", "task_done": 0, "task_total": 0, "all_done": False}
+    acc, pwd, ua = parse_account_info(login_info)
+    if not pwd:
+        return {"account": account, "success": False, "error": "缺少密码", "nickname": "", "total": 0, "checkin": "未知", "ad_status": "未知", "task_done": 0, "task_total": 0, "all_done": False}
+    if not ua:
+        ua = random.choice(BUILTIN_UAS)
+
+    app = WuYouPlan(acc, pwd, ua=ua, proxy_api="")
+    try:
+        app.attest.ensure()
+        payload = {
+            "account": acc,
+            "password": pwd,
+            "device_id": app.device_id,
+            "platform": "android",
+            "app_version": APP_VERSION,
+        }
+        resp = app.session.post(
+            LOGIN_URL,
+            data=compact_json(payload),
+            headers={"Content-Type": "application/json"},
+            verify=False,
+            timeout=15,
+        )
+        data = resp.json()
+        token = data.get("token")
+        if not token:
+            return {"account": account, "success": False, "error": f"登录失败: {str(data)[:200]}", "nickname": "", "total": 0, "checkin": "未知", "ad_status": "未知", "task_done": 0, "task_total": 0, "all_done": False}
+        app.token = token
+        app.session.headers.update({"authorization": f"Bearer {token}"})
+
+        user = app.get_user_info()
+        nickname = user.get("nickname", "")
+        wallet = user.get("wallet", {})
+        total_coins = wallet.get("gold_coins", 0)
+
+        tasks_data = app.get_daily_tasks()
+        task_list = tasks_data.get("tasks", [])
+        task_done = sum(1 for t in task_list if t.get("is_claimed"))
+        task_total = len(task_list)
+
+        # 检查签到
+        checkin_status = "未知"
+        try:
+            resp2 = app.session.post(
+                f"{DAILY_TASKS_URL}/daily_checkin/claim",
+                headers={"Content-Type": "application/json", "authorization": f"Bearer {token}"},
+                verify=False,
+                timeout=15,
+            )
+            r2 = resp2.json()
+            if r2.get("ok"):
+                checkin_status = "未领取"
+            elif "已领取" in str(r2) or "已领" in str(r2):
+                checkin_status = "已领取"
+            else:
+                checkin_status = "已领取"
+        except Exception:
+            checkin_status = "未知"
+
+        # 检查广告
+        ads_info = app.get_ads_info()
+        if not ads_info.get("enabled", False):
+            ad_status = "未启用"
+        else:
+            max_views = ads_info.get("max_views_per_day", 0)
+            if max_views <= 0:
+                ad_status = "已达上限"
+            else:
+                ad_status = f"剩余 {max_views} 次"
+
+        # 判断是否全部完成
+        all_done = (checkin_status == "已领取") and (ad_status in ["已达上限", "未启用"]) and (task_done >= task_total)
+
+        return {
+            "account": account,
+            "success": True,
+            "nickname": nickname,
+            "total": total_coins,
+            "checkin": checkin_status,
+            "ad_status": ad_status,
+            "task_done": task_done,
+            "task_total": task_total,
+            "all_done": all_done,
+            "error": "",
+        }
+    except Exception as e:
+        return {"account": account, "success": False, "error": str(e), "nickname": "", "total": 0, "checkin": "未知", "ad_status": "未知", "task_done": 0, "task_total": 0, "all_done": False}
+
+
+def format_query(result: dict) -> str:
+    acc = mask_account(result["account"])
+    if not result["success"]:
+        return f"❌ {acc}\n   查询失败：{result.get('error', '未知')}"
+
+    nickname = result.get("nickname", "")
+    name = f"〔{nickname}〕" if nickname else ""
+    icon = "✅" if result.get("all_done") else "⏳"
+
+    lines = [f"{icon} {acc} {name}"]
+    lines.append(f"   💰 金币 {result['total']}")
+    lines.append(f"   📝 签到 {result['checkin']}")
+    lines.append(f"   📺 广告 {result['ad_status']}")
+    lines.append(f"   📋 任务 {result['task_done']}/{result['task_total']}")
+
+    if result.get("all_done"):
+        lines.append("   🎉 今日已全部完成")
+
+    return "\n".join(lines)
+
+
+def query_all(accounts: list):
+    if not accounts:
+        sender.reply("未绑定任何账号")
+        return
+    sender.reply(f"🔍 查询 {len(accounts)} 个账号今日状态...")
+    results = []
+    with ThreadPoolExecutor(max_workers=min(len(accounts), 5)) as executor:
+        future_to_account = {executor.submit(query_account, acc): acc for acc in accounts}
+        for future in as_completed(future_to_account):
+            account = future_to_account[future]
+            try:
+                result = future.result()
+            except Exception as e:
+                result = {"account": account, "success": False, "error": str(e), "nickname": "", "total": 0, "checkin": "未知", "ad_status": "未知", "task_done": 0, "task_total": 0, "all_done": False}
+            results.append(result)
+            sender.reply(format_query(result))
+
+    done_count = sum(1 for r in results if r.get("all_done"))
+    total = len(results)
+    sender.reply(
+        "📊 查询汇总\n"
+        "────────────────────\n"
+        f"📱 共 {total} 个账号\n"
+        f"✅ 已完成 {done_count}\n"
+        f"⏳ 待执行 {total - done_count}"
+    )
+    return results
+
+
+def execute_account(account: str, proxy_api: str, skip_check: bool = False) -> dict:
     login_info = middleware.bucketGet(bucket='dd_WuYou_login', key=account)
     if not login_info:
         return {"account": account, "success": False, "error": "缺少登录信息", "logs": [], "earned": 0, "total": 0, "ad_error": "", "checkin": "", "proxy_ip": "-"}
@@ -917,6 +1065,90 @@ def execute_account(account: str, proxy_api: str) -> dict:
         return {"account": account, "success": False, "error": "缺少密码", "logs": [], "earned": 0, "total": 0, "ad_error": "", "checkin": "", "proxy_ip": "-"}
     if not ua:
         ua = random.choice(BUILTIN_UAS)
+
+    # 计划任务模式：先不用代理快速预检，避免浪费代理资源
+    if skip_check:
+        app = WuYouPlan(acc, pwd, ua=ua, proxy_api="")
+        try:
+            app.attest.ensure()
+            # 尝试登录（直连）
+            payload = {
+                "account": acc,
+                "password": pwd,
+                "device_id": app.device_id,
+                "platform": "android",
+                "app_version": APP_VERSION,
+            }
+            resp = app.session.post(
+                LOGIN_URL,
+                data=compact_json(payload),
+                headers={"Content-Type": "application/json"},
+                verify=False,
+                timeout=15,
+            )
+            data = resp.json()
+            token = data.get("token")
+            if not token:
+                return {"account": account, "success": False, "error": f"登录失败: {str(data)[:200]}", "logs": [], "earned": 0, "total": 0, "ad_error": "", "checkin": "", "proxy_ip": "-"}
+            app.token = token
+            app.session.headers.update({"authorization": f"Bearer {token}"})
+
+            # 查询今日状态
+            user = app.get_user_info()
+            tasks_data = app.get_daily_tasks()
+
+            # 检查是否所有任务都已领取
+            all_claimed = True
+            for task in tasks_data.get("tasks", []):
+                if task.get("is_completed") and not task.get("is_claimed"):
+                    all_claimed = False
+                    break
+
+            # 检查广告是否已看完（max_views <= 0 或 items 为空）
+            ads_info = app.get_ads_info()
+            ads_done = not ads_info.get("enabled", False) or ads_info.get("max_views_per_day", 0) <= 0
+
+            # 检查签到是否已领取
+            checkin_done = True
+            try:
+                resp2 = app.session.post(
+                    f"{DAILY_TASKS_URL}/daily_checkin/claim",
+                    headers={"Content-Type": "application/json", "authorization": f"Bearer {token}"},
+                    verify=False,
+                    timeout=15,
+                )
+                if "已领取" not in str(resp2.json()):
+                    checkin_done = False
+            except Exception:
+                checkin_done = False
+
+            wallet = user.get("wallet", {})
+            total_coins = wallet.get("gold_coins", 0)
+            nickname = user.get("nickname", "")
+
+            if all_claimed and ads_done and checkin_done:
+                return {
+                    "account": account,
+                    "success": True,
+                    "nickname": nickname,
+                    "start_coins": total_coins,
+                    "end_coins": total_coins,
+                    "earned": 0,
+                    "total": total_coins,
+                    "tasks": tasks_data,
+                    "claimed_tasks": [],
+                    "logs": [f"[{datetime.now().strftime('%H:%M:%S')}] 预检跳过：今日任务已全部完成"],
+                    "ad_error": "今日已完成",
+                    "checkin": "已领取",
+                    "proxy_ip": "直连预检",
+                }
+
+            # 有任务要做，回退到完整执行（走代理）
+        except Exception as e:
+            # 预检异常，回退到完整执行
+            pass
+
+    # 正常执行（走代理）
     app = WuYouPlan(acc, pwd, ua=ua, proxy_api=proxy_api)
     try:
         return app.run()
@@ -924,16 +1156,54 @@ def execute_account(account: str, proxy_api: str) -> dict:
         return {"account": account, "success": False, "error": str(e), "logs": app.result_lines if hasattr(app, 'result_lines') else [], "earned": 0, "total": 0, "ad_error": "", "checkin": "", "proxy_ip": app.proxy_mgr.proxy_ip if hasattr(app, 'proxy_mgr') else "-"}
 
 
-def execute_all(accounts: list, proxy_api: str, notify_owner: bool = True):
+def execute_all(accounts: list, proxy_api: str, notify_owner: bool = True, skip_check: bool = False):
     if not accounts:
         sender.reply("未绑定任何账号")
         return []
     proxy_api = proxy_api or load_proxy_api()
+
+    # 计划任务模式：先查询，全完成的直接发结果，不浪费代理
+    if skip_check:
+        sender.reply(f"🔍 预检 {len(accounts)} 个账号...")
+        query_results = []
+        with ThreadPoolExecutor(max_workers=min(len(accounts), 5)) as executor:
+            future_to_account = {executor.submit(query_account, acc): acc for acc in accounts}
+            for future in as_completed(future_to_account):
+                account = future_to_account[future]
+                try:
+                    result = future.result()
+                except Exception as e:
+                    result = {"account": account, "success": False, "error": str(e), "nickname": "", "total": 0, "checkin": "未知", "ad_status": "未知", "task_done": 0, "task_total": 0, "all_done": False}
+                query_results.append(result)
+
+        # 分离已完成和待执行的
+        done_results = [r for r in query_results if r.get("all_done")]
+        todo_accounts = [r["account"] for r in query_results if r.get("success") and not r.get("all_done")]
+        fail_accounts = [r["account"] for r in query_results if not r.get("success")]
+
+        # 发已完成的结果
+        if done_results:
+            for r in done_results:
+                sender.reply(format_query(r))
+
+        if not todo_accounts:
+            sender.reply(
+                "📊 执行汇总\n"
+                "────────────────────\n"
+                f"📱 共 {len(accounts)} 个账号\n"
+                f"✅ 全部已完成，无需执行\n"
+                f"💰 总收益 +0"
+            )
+            return query_results
+
+        sender.reply(f"⏳ {len(todo_accounts)} 个账号有任务待执行，开始跑...")
+        accounts = todo_accounts
+
     sender.reply(f"🚀 执行 {len(accounts)} 个账号...")
     results = []
     with ThreadPoolExecutor(max_workers=min(len(accounts), 5)) as executor:
         future_to_account = {
-            executor.submit(execute_account, acc, proxy_api): acc
+            executor.submit(execute_account, acc, proxy_api, False): acc
             for acc in accounts
         }
         for future in as_completed(future_to_account):
@@ -949,8 +1219,11 @@ def execute_all(accounts: list, proxy_api: str, notify_owner: bool = True):
                 sender.reply(f"{formatted}\n[CQ:at,qq={owner_id}]")
             else:
                 sender.reply(formatted)
-    summary = format_summary(results)
+    summary = format_summary(results, done_count=len(done_results) if skip_check else 0)
     sender.reply(summary)
+    # 合并查询结果和执行结果返回
+    if skip_check:
+        return done_results + results
     return results
 
 
@@ -962,7 +1235,8 @@ def Administration():
         "1️⃣  提交账号\n"
         "2️⃣  执行任务\n"
         "3️⃣  删除账号\n"
-        "4️⃣  查看账号"
+        "4️⃣  查看账号\n"
+        "6️⃣  查询今日状态 🔍"
     )
     if sender.isAdmin():
         base_message += "\n5️⃣  全体执行 👑"
@@ -1056,6 +1330,12 @@ def Administration():
         msg += f"────────────────────\n共 {len(accounts)} 个账号"
         sender.reply(msg)
         return
+    elif choice == 6:
+        if not accounts:
+            sender.reply("未绑定任何账号")
+            return
+        query_all(accounts)
+        return
     elif choice == 5 and sender.isAdmin():
         if not accounts:
             sender.reply("管理员未绑定任何账号")
@@ -1097,7 +1377,7 @@ def main():
         if not accounts:
             sender.reply("未绑定任何账号")
             return
-        execute_all(accounts, load_proxy_api())
+        execute_all(accounts, load_proxy_api(), skip_check=True)
         return
     if message == "无忧运行":
         accounts = parse_accounts(uservalue)
@@ -1105,7 +1385,7 @@ def main():
             sender.reply("未绑定任何账号")
             return
         sender.reply(f"🚀 一键运行 {len(accounts)} 个账号...")
-        execute_all(accounts, load_proxy_api())
+        execute_all(accounts, load_proxy_api(), skip_check=True)
         return
     Administration()
 
